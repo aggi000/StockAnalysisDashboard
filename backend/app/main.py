@@ -1,17 +1,64 @@
 import os
+import time
+import logging
+from json import JSONDecodeError
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Any
 from functools import lru_cache
+from typing import Tuple
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from requests import exceptions as requests_exceptions
+
+try:
+    import requests_cache
+except ImportError:  # pragma: no cover
+    requests_cache = None
 
 from .indicators import compute_indicators
 
+logger = logging.getLogger("stock-analysis")
+
 app = FastAPI(title="Stock Analysis API", version="0.1.0")
+
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
+_history_cache: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
+_quote_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+if requests_cache and os.environ.get("ENABLE_REQUESTS_CACHE", "1") != "0":
+    try:
+        requests_cache.install_cache(
+            "yfinance_cache",
+            backend="memory",
+            expire_after=CACHE_TTL_SECONDS,
+        )
+        logger.info("requests-cache enabled for yfinance (TTL=%s)", CACHE_TTL_SECONDS)
+    except Exception as cache_err:  # pragma: no cover
+        logger.warning("Failed to enable requests-cache: %s", cache_err)
+
+
+class UpstreamRateLimitError(Exception):
+    """Raised when the upstream market data provider rate limits requests."""
+
+
+def _is_rate_limited_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "429" in msg or "too many requests" in msg:
+        return True
+    if isinstance(err, JSONDecodeError):
+        return True
+    response = getattr(err, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        return True
+    if isinstance(err, requests_exceptions.HTTPError) and err.response is not None:
+        return err.response.status_code == 429
+    return False
 
 allowed_origins = {
     "http://localhost:5173",
@@ -97,6 +144,25 @@ def _safe_lookup(source, key):
         return None
 
 
+def _cache_get(store: Dict, key):
+    if CACHE_TTL_SECONDS <= 0:
+        return None
+    entry = store.get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if expires_at > time.time():
+        return value
+    store.pop(key, None)
+    return None
+
+
+def _cache_set(store: Dict, key, value):
+    if CACHE_TTL_SECONDS <= 0:
+        return
+    store[key] = (time.time() + CACHE_TTL_SECONDS, value)
+
+
 def _safe_fast_info_value(info, key):
     return _safe_lookup(info, key)
 
@@ -127,21 +193,29 @@ def _sanitize_volume(value):
 
 
 def _download_history(ticker: str, period: str, interval: str):
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception as primary_error:
-        df = None
-    else:
-        primary_error = None
+    last_error: Optional[Exception] = None
+    rate_limited = False
 
-    if df is None or df.empty:
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as err:
+            last_error = err
+            if _is_rate_limited_error(err):
+                rate_limited = True
+            logger.warning("yf.download failed for %s (attempt %s/%s): %s", ticker, attempt + 1, 3, err)
+        time.sleep(1.5 * (attempt + 1))
+
+    for attempt in range(3):
         try:
             df = _get_ticker_obj(ticker).history(
                 period=period,
@@ -149,15 +223,31 @@ def _download_history(ticker: str, period: str, interval: str):
                 auto_adjust=False,
                 actions=False,
             )
-        except Exception as fallback_error:
-            raise fallback_error if primary_error is None else primary_error
+            if df is not None and not df.empty:
+                return df
+        except Exception as err:
+            last_error = err
+            if _is_rate_limited_error(err):
+                rate_limited = True
+            logger.warning("ticker.history failed for %s (attempt %s/%s): %s", ticker, attempt + 1, 3, err)
+        time.sleep(1.5 * (attempt + 1))
 
-    return df
+    if rate_limited:
+        raise UpstreamRateLimitError(str(last_error) if last_error else "Rate limited by upstream provider")
+
+    if last_error:
+        raise last_error
+    return pd.DataFrame()
 
 
 @app.get("/api/quote/{ticker}", response_model=QuoteResponse)
 def get_quote(ticker: str):
-    t = _get_ticker_obj(ticker.upper())
+    symbol = ticker.upper()
+    cached = _cache_get(_quote_cache, symbol)
+    if cached is not None:
+        return QuoteResponse(**cached)
+
+    t = _get_ticker_obj(symbol)
     fast = {}
     info = {}
     try:
@@ -195,8 +285,8 @@ def get_quote(ticker: str):
         except Exception:
             pass
 
-    return QuoteResponse(
-        ticker=ticker.upper(),
+    response = QuoteResponse(
+        ticker=symbol,
         price=price,
         currency=currency,
         previousClose=previous_close,
@@ -212,6 +302,8 @@ def get_quote(ticker: str):
         fiftyTwoWeekHigh=_safe_float(info, "fiftyTwoWeekHigh"),
         fiftyTwoWeekLow=_safe_float(info, "fiftyTwoWeekLow"),
     )
+    _cache_set(_quote_cache, symbol, response.dict())
+    return response
 
 @app.get("/api/history/{ticker}", response_model=HistoryResponse)
 def get_history(
@@ -220,12 +312,21 @@ def get_history(
     interval: Literal["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"] = "1d",
     indicators: Optional[str] = Query(None, description="Comma-separated list: sma,ema,rsi,macd,boll")
 ):
-    try:
-        df = _download_history(ticker.upper(), period, interval)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to download history: {e}")
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail="No historical data found")
+    symbol = ticker.upper()
+    cache_key = (symbol, period, interval)
+    cached_df = _cache_get(_history_cache, cache_key)
+    if cached_df is not None:
+        df = cached_df.copy()
+    else:
+        try:
+            df = _download_history(symbol, period, interval)
+        except UpstreamRateLimitError as e:
+            raise HTTPException(status_code=429, detail="Rate limited by data provider. Please try again shortly.") from e
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Failed to download history: {e}")
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail="No historical data found")
+        _cache_set(_history_cache, cache_key, df.copy())
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -250,4 +351,4 @@ def get_history(
         wants = [x.strip().lower() for x in indicators.split(",") if x.strip()]
         ind_out = compute_indicators(df[["close","volume"]].rename(columns={"close": "Close", "volume": "Volume"}), wants)
 
-    return HistoryResponse(ticker=ticker.upper(), period=period, interval=interval, candles=candles, indicators=ind_out)
+    return HistoryResponse(ticker=symbol, period=period, interval=interval, candles=candles, indicators=ind_out)
