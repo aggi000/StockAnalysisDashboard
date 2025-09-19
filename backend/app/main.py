@@ -73,16 +73,35 @@ def _get_ticker_obj(ticker: str):
     return yf.Ticker(ticker)
 
 
-def _safe_fast_info_value(info, key):
-    try:
-        return info.get(key)
-    except KeyError:
+def _safe_lookup(source, key):
+    if source is None:
         return None
+    try:
+        getter = getattr(source, 'get', None)
+        if callable(getter):
+            try:
+                return getter(key)
+            except KeyError:
+                return None
+        if isinstance(source, dict):
+            return source.get(key)
     except Exception:
+        pass
+    try:
+        return source[key]  # type: ignore[index]
+    except (KeyError, TypeError, AttributeError):
+        pass
+    try:
+        return getattr(source, key)
+    except AttributeError:
         return None
 
+
+def _safe_fast_info_value(info, key):
+    return _safe_lookup(info, key)
+
 def _safe_float(d, key):
-    v = d.get(key)
+    v = _safe_lookup(d, key)
     try:
         return float(v) if v is not None else None
     except Exception:
@@ -152,7 +171,7 @@ def get_quote(ticker: str):
 
     # 1) Price: fast_info → info → history close
     price = _safe_float(fast, "last_price") or _safe_float(info, "regularMarketPrice")
-    currency = fast.get("currency") or info.get("currency")
+    currency = _safe_fast_info_value(fast, "currency") or _safe_fast_info_value(info, "currency")
 
     # 2) Previous close / open / day high / day low
     previous_close = _safe_float(fast, "previous_close") or _safe_float(info, "regularMarketPreviousClose")
