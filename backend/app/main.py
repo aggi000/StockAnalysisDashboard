@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -17,6 +19,10 @@ allowed_origins = {
     "http://localhost:4173",
     "http://127.0.0.1:4173",
 }
+
+extra_origins = os.environ.get("ALLOWED_ORIGINS", "")
+if extra_origins:
+    allowed_origins.update({origin.strip() for origin in extra_origins.split(",") if origin.strip()})
 
 app.add_middleware(
     CORSMiddleware,
