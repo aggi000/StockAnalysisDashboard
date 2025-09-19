@@ -1,0 +1,46 @@
+# General
+.DS_Store
+.env
+.env.*
+.venv/
+venv/
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+.idea/
+.vscode/
+logs/
+tmp/
+coverage/
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+pip-wheel-metadata/
+htmlcov/
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+#backend
+backend/.venv/
+backend/venv/
